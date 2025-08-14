@@ -54,3 +54,25 @@ Default `ohlcv.calendar.sessions` is weekday-only (Mon–Fri). Replace with an e
 - Given an empty store, provider returns rows for the window → final DF contiguous.
 - With partial store coverage, provider called **only** for missing spans.
 - When provider can’t fill, `DataNotContiguous` raised with correct spans.
+
+## Wire `SqlStore` with `lightql`
+
+```python
+from ohlcv import get_ohlcv_df
+from ohlcv.sql_store import SqlStore
+
+# 1) Run migrations once (CLI from lightql):
+# lightql migrations apply --sql-dir sql --dsn sqlite:///app.db
+
+# 2) Use the store in your app
+store = SqlStore(dsn="sqlite:///app.db", sql_dir="sql")
+provider = ...  # your Provider implementation
+
+df = get_ohlcv_df(["KOS", "ATEC"], "2025-01-01", "2025-03-31", store=store, provider=provider)
+print(df.head())
+```
+
+## Notes
+- `bars.window` reads per ticker to keep list-parameter handling simple.
+- Upserts are per-row for clarity. If you need speed, add a bulk insert query (e.g., `:script`) and batch values.
+- Dates are stored as `YYYY-MM-DD` TEXT in SQLite; the service normalizes to pandas datetime on read.
