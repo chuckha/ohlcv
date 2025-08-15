@@ -3,18 +3,40 @@ from datetime import date, timedelta
 from typing import Sequence
 import pandas as pd
 import yfinance as yf
+import logging
+from contextlib import contextmanager
 
 from .protocols import Provider
 
 REQUIRED_COLS = ["ticker", "date", "open", "high", "low", "close", "volume"]
 
+class _DropYFMissing(logging.Filter):
+    NEEDLES = ("YFPricesMissingError", "Failed download")
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        return not any(n in msg for n in self.NEEDLES)
+
 class YFProvider(Provider):
     """yfinance Provider for daily OHLCV using yf.download (robust), with tidy normalization."""
 
-    def __init__(self, *, auto_adjust: bool = False):
-        if auto_adjust:
-            raise ValueError("Store policy: only raw (unadjusted) OHLCV allowed; set auto_adjust=False")
-        self.auto_adjust = False
+    def __init__(self, *, auto_adjust: bool = False, quiet_missing: bool = True):
+        self.auto_adjust = bool(auto_adjust)
+        self._quiet_missing = quiet_missing
+        self._yf_logger = logging.getLogger("yfinance")
+        self._yf_filter = _DropYFMissing()
+
+    @contextmanager
+    def _silence_yf(self):
+        if self._quiet_missing:
+            self._yf_logger.addFilter(self._yf_filter)
+        try:
+            yield
+        finally:
+            if self._quiet_missing:
+                self._yf_logger.removeFilter(self._yf_filter)
 
     def fetch_df(self, tickers: Sequence[str], start: date, end: date) -> pd.DataFrame:
         tks = [str(t).upper().strip() for t in tickers]
@@ -28,7 +50,8 @@ class YFProvider(Provider):
         frames: list[pd.DataFrame] = []
 
         # 1) Bulk path via yf.download (handles multi-ticker reliably)
-        bulk = _download_bulk(tks, yf_start, yf_end, auto_adjust=self.auto_adjust)
+        with self._silence_yf():
+            bulk = _download_bulk(tks, yf_start, yf_end, auto_adjust=self.auto_adjust)
         if bulk is not None and not bulk.empty:
             frames.append(_normalize_trim(bulk, start, end))
 
@@ -37,7 +60,8 @@ class YFProvider(Provider):
         for t in tks:
             if t in got:
                 continue
-            one = _download_one(t, yf_start, yf_end, auto_adjust=self.auto_adjust)
+            with self._silence_yf():
+                one = _download_one(t, yf_start, yf_end, auto_adjust=self.auto_adjust)
             if one is None or one.empty:
                 continue
             frames.append(_normalize_trim(one, start, end))

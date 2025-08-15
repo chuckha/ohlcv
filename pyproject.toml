@@ -13,7 +13,7 @@ dependencies = [
     "pandas-market-calendars (>=5.1.1,<6.0.0)",
     "scipy (>=1.16.1,<2.0.0)"
 ]
-packages = [ { include = "ohclv" } ]
+packages = [ { include = "ohlcv" } ]
 
 
 [build-system]

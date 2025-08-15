@@ -1,12 +1,10 @@
-from .service import get_ohlcv_df
+from .client import get_ohlcv_df, configure, OhlcvClient
 from .errors import DataNotContiguous, ProviderError
-from . import protocols
-from .provider_yf import YFProvider
 
 __all__ = [
     "get_ohlcv_df",
+    "configure",
+    "OhlcvClient",
     "DataNotContiguous",
     "ProviderError",
-    "protocols",
-    "YFProvider",
 ]
