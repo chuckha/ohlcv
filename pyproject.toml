@@ -1,6 +1,6 @@
 [project]
 name = "ohlcv"
-version = "0.1.0"
+version = "0.3.0"
 description = ""
 authors = [
     {name = "chuckha",email = "chuckha@hey.com"}
@@ -14,6 +14,7 @@ dependencies = [
     "scipy (>=1.16.1,<2.0.0)"
 ]
 packages = [ { include = "ohlcv" } ]
+include = ["ohlcv/sql/**/*"]
 
 
 [build-system]

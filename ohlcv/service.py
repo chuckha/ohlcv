@@ -1,14 +1,22 @@
 from __future__ import annotations
-from typing import Iterable, Sequence, Dict, List, Tuple
-from datetime import date, datetime
+from typing import Sequence, Dict, List, Tuple, DefaultDict
+from collections import defaultdict
+from datetime import date, timedelta
+import logging
 import pandas as pd
 
-from .protocols import Store, Provider
+from .sql_store import SqlStore
+from .provider_yf import YFProvider
 from .calendar import sessions
+from .utils import wide_to_tidy, tidy_to_wide, TIDY_COLS
 from .errors import DataNotContiguous
 
-Schema = List[str]
-REQUIRED_COLS: Schema = ["ticker", "date", "open", "high", "low", "close", "volume"]
+log = logging.getLogger(__name__)
+
+# Heuristics
+YOUNG_THRESHOLD_DAYS = 365
+EMPTY_SPAN_MIN_SESSIONS = 5
+RECENT_BUFFER_SESSIONS = 2
 
 
 def get_ohlcv_df(
@@ -16,201 +24,213 @@ def get_ohlcv_df(
     start: date | str,
     end: date | str,
     *,
-    store: Store,
-    provider: Provider,
-    include_partial: bool = False,
-    market: str = "NYSE",                 # <-- default explicit market
-    availability: str = "clip",           # <-- "strict" | "clip"
+    store: SqlStore,
+    provider: YFProvider,
+    market: str = "NYSE",
+    availability: str = "clip",
 ) -> pd.DataFrame:
-    """Local-first OHLCV fetch with gap fill, returning a contiguous daily DataFrame.
+    tks = [str(t).upper().strip() for t in tickers if str(t).strip()]
+    s = pd.to_datetime(start).date() if not isinstance(start, date) else start
+    e = pd.to_datetime(end).date() if not isinstance(end, date) else end
 
-    availability:
-      - "strict": require contiguity across the full [start,end] for each ticker
-      - "clip":   ignore leading/trailing gaps outside each ticker's present window
-                   (still strict about mid-window gaps)
-    """
-    tks = _normalize_tickers(tickers)
-    s, e = _normalize_dates(start, end)
-    base_expected = sessions(s, e, market)  # session dates for the market
+    sess = pd.to_datetime(sessions(s, e, market))
+    sess = pd.DatetimeIndex(sess).tz_localize(None).normalize()
 
-    # 1) Read what's present
-    df0 = store.read_df(tks, s, e)
-    df0 = _normalize_df(df0)
+    # 1) Read local -> tidy -> MI aligned to sessions
+    local_tidy = store.read_df(tks, s, e)
+    local_mi = tidy_to_wide(local_tidy).reindex(sess)
 
-    # 2) Compute gaps per ticker (strict expectations initially)
-    gaps = _find_gaps(df0, tks, base_expected)
+    # 2) Initial gaps from local cache
+    gaps = _find_mi_gaps(local_mi, tks, sess)
 
-    # 3) Fetch + upsert missing spans
+    # 3) Load symbol_meta and prune pre-IPO spans per ticker
+    meta = store.get_meta(tks)
+    span_to_tickers: DefaultDict[Tuple[date, date], List[str]] = defaultdict(list)
+
     for tkr, spans in gaps.items():
+        if not spans:
+            continue
+        m = meta.get(tkr, {})
+        eff_start = s
+        # If we know a first_seen_date, don't fetch before it
+        if m and m.get("first_seen_date"):
+            try:
+                fs = pd.to_datetime(m["first_seen_date"]).date()
+                eff_start = max(eff_start, fs)
+            except Exception:
+                pass
+        # If we've previously marked skip_before for this ticker, don't fetch at/before it
+        if m and m.get("skip_before"):
+            try:
+                sb = pd.to_datetime(m["skip_before"]).date() + timedelta(days=1)
+                eff_start = max(eff_start, sb)
+            except Exception:
+                pass
+
+        # Clip or drop spans against eff_start
         for span_s, span_e in spans:
-            fetched = provider.fetch_df([tkr], span_s, span_e)
-            fetched = _normalize_df(fetched)
-            if not fetched.empty:
-                store.upsert_df(fetched)
+            if span_e < eff_start:
+                continue  # entirely before effective window
+            adj_s = max(span_s, eff_start)
+            if adj_s <= span_e:
+                span_to_tickers[(adj_s, span_e)].append(tkr)
 
-    # 4) Re-read final
-    final = store.read_df(tks, s, e)
-    final = _normalize_df(final)
+    # 4) Fetch in MI batches per span; learn meta from results
+    for (gs, ge), tlist in span_to_tickers.items():
+        fetched_mi = provider.fetch_mi(tlist, gs, ge)
+        if fetched_mi is None or fetched_mi.empty:
+            # every ticker in tlist empty over this span; mark skip_before conservatively
+            _maybe_mark_skip(store, tlist, gs, ge, sess)
+            continue
 
-    # 5) Validate contiguity. If availability==clip, ignore pre/post-listing gaps.
-    missing_after = _find_gaps(final, tks, base_expected)
+        # Upsert tidy delta (only rows within [gs,ge])
+        tidy = wide_to_tidy(fetched_mi)
+        if tidy.empty:
+            _maybe_mark_skip(store, tlist, gs, ge, sess)
+            continue
 
+        # Assign single-symbol UNKNOWN fallback if needed
+        if len(tlist) == 1:
+            if ("ticker" not in tidy.columns) or tidy["ticker"].eq("UNKNOWN").all():
+                tidy.loc[:, "ticker"] = tlist[0]
+
+        mask = (tidy["date"] >= pd.to_datetime(gs)) & (tidy["date"] <= pd.to_datetime(ge))
+        tidy = tidy.loc[mask, TIDY_COLS]
+        if not tidy.empty:
+            store.upsert_df(tidy)
+            # learn bounds
+            store.upsert_bounds_from_df(tidy)
+
+        # For tickers in this span that still had zero rows, consider advancing skip_before
+        zero = _zero_tickers_in_fetch(fetched_mi, tlist)
+        if zero:
+            _maybe_mark_skip(store, zero, gs, ge, sess)
+
+    # 5) Re-read final, pivot, contiguity (availability-aware)
+    final_tidy = store.read_df(tks, s, e)
+    final_mi = tidy_to_wide(final_tidy).reindex(sess)
+
+    missing_after = _find_mi_gaps(final_mi, tks, sess)
     if availability == "clip" and missing_after:
-        # Determine present windows per ticker from what we *actually* have
-        present_bounds = _present_bounds(final, tks)
-        # Build per-ticker expected sessions clipped to present window
-        expected_by = {
-            t: [d for d in base_expected if _in_present_window(d, present_bounds.get(t), s, e)]
-            for t in tks
-        }
-        # Recompute gaps against clipped expectations
-        missing_after = _find_gaps_per_ticker(final, tks, expected_by)
+        bounds = _mi_present_bounds(final_mi, tks)
+        missing_after = _clip_mi_gaps(missing_after, bounds)
 
-    if missing_after and not include_partial:
-        raise DataNotContiguous(missing_after)
+    # If a ticker has no present window at all, don't fail the batch
+    remaining = {k: v for k, v in missing_after.items() if v} if missing_after else {}
+    if remaining:
+        raise DataNotContiguous(remaining)
 
-    # Keep only expected sessions (strict base); returning extra days is confusing
-    if not final.empty:
-        final = final[final["date"].isin(pd.to_datetime(base_expected))]
-        final = final[final["ticker"].isin(tks)]
-        final = final.sort_values(["ticker", "date"]).reset_index(drop=True)
-
-    return final
-
-# -----------------
-# helpers (private)
-# -----------------
-
-def _present_bounds(df: pd.DataFrame, tickers: Sequence[str]) -> Dict[str, Tuple[date | None, date | None]]:
-    """Return each ticker's (min_date, max_date) present in df (date objects)."""
-    out: Dict[str, Tuple[date | None, date | None]] = {t: (None, None) for t in tickers}
-    if df.empty:
-        return out
-    agg = df.groupby("ticker")["date"].agg(["min", "max"]).reset_index()
-    for _, row in agg.iterrows():
-        t = str(row["ticker"]).upper()
-        dmin = pd.to_datetime(row["min"]).date() if pd.notna(row["min"]) else None
-        dmax = pd.to_datetime(row["max"]).date() if pd.notna(row["max"]) else None
-        out[t] = (dmin, dmax)
-    return out
+    return final_mi
 
 
-def _in_present_window(d: date, bounds: Tuple[date | None, date | None] | None, s: date, e: date) -> bool:
-    if not bounds:
-        return True  # unknown → keep strict; gaps will remain if truly missing
-    dmin, dmax = bounds
-    # Clip only leading/trailing gaps: if we have at least one row, restrict to [dmin, dmax]
-    if dmin is not None and d < dmin:
-        return False
-    if dmax is not None and d > dmax:
-        return False
-    return True
+# --- helpers ---
 
-
-def _find_gaps(df: pd.DataFrame, tickers: Sequence[str], expected: Sequence[date]) -> Dict[str, List[Tuple[date, date]]]:
-    exp_list = list(pd.to_datetime(expected))
-    present: Dict[str, set] = {t: set() for t in tickers}
-    if not df.empty:
-        tmp = df[["ticker", "date"]].copy()
-        tmp["date"] = pd.to_datetime(tmp["date"]).dt.normalize()
-        for t, grp in tmp.groupby("ticker"):
-            present.setdefault(str(t).upper(), set()).update(set(grp["date"].unique()))
-
-    gaps: Dict[str, List[Tuple[date, date]]] = {}
-    for t in tickers:
-        have = present.get(t, set())
-        miss = [d for d in exp_list if d not in have]
-        if not miss:
-            continue
-        spans: List[Tuple[date, date]] = []
-        start = miss[0]
-        prev = miss[0]
-        for d in miss[1:]:
-            if (d - prev).days == 1:
-                prev = d
-            else:
-                spans.append((start.date(), prev.date()))
-                start = prev = d
-        spans.append((start.date(), prev.date()))
-        gaps[str(t).upper()] = spans
-    return gaps
-
-
-def _find_gaps_per_ticker(df: pd.DataFrame, tickers: Sequence[str], expected_by: Dict[str, List[date]]) -> Dict[str, List[Tuple[date, date]]]:
-    present: Dict[str, set] = {t: set() for t in tickers}
-    if not df.empty:
-        tmp = df[["ticker", "date"]].copy()
-        tmp["date"] = pd.to_datetime(tmp["date"]).dt.normalize()
-        for t, grp in tmp.groupby("ticker"):
-            present.setdefault(str(t).upper(), set()).update(set(grp["date"].unique()))
-
-    gaps: Dict[str, List[Tuple[date, date]]] = {}
-    for t in tickers:
-        exp_list = list(pd.to_datetime(expected_by.get(t, [])))
-        if not exp_list:
-            continue  # no expectations for this ticker after clipping
-        have = present.get(t, set())
-        miss = [d for d in exp_list if d not in have]
-        if not miss:
-            continue
-        spans: List[Tuple[date, date]] = []
-        start = miss[0]
-        prev = miss[0]
-        for d in miss[1:]:
-            if (d - prev).days == 1:
-                prev = d
-            else:
-                spans.append((start.date(), prev.date()))
-                start = prev = d
-        spans.append((start.date(), prev.date()))
-        gaps[str(t).upper()] = spans
-    return gaps
-
-
-def _normalize_tickers(tickers: Sequence[str]) -> List[str]:
-    seen = set()
+def _zero_tickers_in_fetch(mi: pd.DataFrame, tlist: Sequence[str]) -> List[str]:
     out: List[str] = []
-    for t in (t.upper().strip() for t in tickers):
-        if t and t not in seen:
-            seen.add(t)
+    for t in tlist:
+        try:
+            sub = mi.xs(t, axis=1, level=0, drop_level=False)
+        except Exception:
             out.append(t)
-    if not out:
-        raise ValueError("No tickers provided")
+            continue
+        if sub.dropna(how="all").empty:
+            out.append(t)
     return out
 
 
-def _normalize_dates(start: date | str, end: date | str) -> Tuple[date, date]:
-    s = _to_date(start)
-    e = _to_date(end)
-    if e < s:
-        raise ValueError("end < start")
-    return s, e
+def _maybe_mark_skip(store: SqlStore, tickers: Sequence[str], gs: date, ge: date, sess: pd.DatetimeIndex) -> None:
+    # Only mark skip for sufficiently long historical spans and not too close to today
+    # span sessions count
+    span_len = int(((sess >= pd.to_datetime(gs)) & (sess <= pd.to_datetime(ge))).sum())
+    if span_len < EMPTY_SPAN_MIN_SESSIONS:
+        return
+    if len(sess) >= RECENT_BUFFER_SESSIONS and pd.to_datetime(ge) > sess.max() - pd.Timedelta(days=RECENT_BUFFER_SESSIONS*2):
+        # simple guard: don't mark if ge is very close to most recent session
+        return
+    for t in tickers:
+        store.advance_skip_before(t, ge)
+
+def _find_mi_gaps(mi: pd.DataFrame, tickers: Sequence[str], sess: pd.DatetimeIndex) -> Dict[str, List[Tuple[date, date]]]:
+    gaps: Dict[str, List[Tuple[date, date]]] = {}
+    # When MI, columns are like (field, ticker) or (ticker, field) depending on pivot order.
+    # Our tidy_to_wide produced: level0=field, level1=ticker
+    if not isinstance(mi.columns, pd.MultiIndex) or mi.empty:
+        return {t: [(sess[0].date(), sess[-1].date())] for t in tickers} if len(sess) else {}
+
+    # define a function to get a Series of 'present' boolean per ticker based on Close
+    def present_series(t: str) -> pd.Series:
+        # columns order from tidy_to_wide: (field, ticker)
+        try:
+            s = mi["close", t]
+        except Exception:
+            # fallback: any of open/high/low/close
+            cols = [c for c in [("open", t),("high", t),("low", t),("close", t)] if c in mi.columns]
+            if not cols:
+                return pd.Series([False]*len(sess), index=sess)
+            s = mi[cols].bfill(axis=1).iloc[:,0]
+        return s.notna().reindex(sess, fill_value=False)
+
+    for t in tickers:
+        pres = present_series(t)
+        if pres.all():
+            continue
+        miss_dates = sess[~pres]
+        if len(miss_dates) == 0:
+            continue
+        # coalesce to spans
+        spans = _coalesce_by_session_index(miss_dates, sess)
+        gaps[t] = spans
+    return gaps
 
 
-def _to_date(x: date | str) -> date:
-    if isinstance(x, date):
-        return x
-    return datetime.strptime(str(x), "%Y-%m-%d").date()
+def _mi_present_bounds(mi: pd.DataFrame, tickers: Sequence[str]) -> Dict[str, Tuple[date | None, date | None]]:
+    bounds: Dict[str, Tuple[date | None, date | None]] = {t: (None, None) for t in tickers}
+    if mi is None or mi.empty:
+        return bounds
+    # using close level
+    if isinstance(mi.columns, pd.MultiIndex) and ("close" in mi.columns.get_level_values(0)):
+        close = mi["close"]
+        for t in close.columns:
+            s = close[t].dropna()
+            if s.empty: continue
+            bounds[str(t)] = (s.index[0].date(), s.index[-1].date())
+    return bounds
 
 
-def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None:
-        return _empty_df()
-    if df.empty:
-        return _empty_df()
-    missing = [c for c in REQUIRED_COLS if c not in df.columns]
-    if missing:
-        raise ValueError(f"DataFrame missing columns: {missing}")
-    out = df.copy()
-    out["ticker"] = out["ticker"].astype(str).str.upper()
-    # ensure date is datetime64[ns]
-    out["date"] = pd.to_datetime(out["date"]).dt.normalize()
-    # light type coercions (non-strict)
-    for c in ["open", "high", "low", "close"]:
-        out[c] = out[c].astype(float)
-    out["volume"] = out["volume"].astype("int64", errors="ignore") if hasattr(out["volume"], "astype") else out["volume"]
-    return out[REQUIRED_COLS]
+def _clip_mi_gaps(gaps: Dict[str, List[Tuple[date, date]]], bounds: Dict[str, Tuple[date | None, date | None]]):
+    clipped: Dict[str, List[Tuple[date, date]]] = {}
+    for t, spans in gaps.items():
+        dmin, dmax = bounds.get(t, (None, None))
+        if dmin is None and dmax is None:
+            clipped[t] = spans
+            continue
+        kept: List[Tuple[date, date]] = []
+        for s, e in spans:
+            # drop leading/trailing parts outside [dmin,dmax]
+            if dmin is not None and e < dmin:  # entirely before
+                continue
+            if dmax is not None and s > dmax:  # entirely after
+                continue
+            ns = max(s, dmin) if dmin is not None else s
+            ne = min(e, dmax) if dmax is not None else e
+            if ns <= ne:
+                kept.append((ns, ne))
+        if kept:
+            clipped[t] = kept
+    return clipped
 
-
-def _empty_df() -> pd.DataFrame:
-    return pd.DataFrame(columns=REQUIRED_COLS)
+def _coalesce_by_session_index(miss_dates: pd.DatetimeIndex, sess: pd.DatetimeIndex):
+    if len(miss_dates) == 0:
+        return []
+    pos = pd.Index(sess)  # map each session date to its index position
+    miss_pos = sorted(pos.get_indexer(miss_dates))  # positions of missing sessions
+    spans = []
+    start_i = prev_i = miss_pos[0]
+    for i in miss_pos[1:]:
+        if i == prev_i + 1:           # consecutive in the sessions index
+            prev_i = i
+        else:
+            spans.append((sess[start_i].date(), sess[prev_i].date()))
+            start_i = prev_i = i
+    spans.append((sess[start_i].date(), sess[prev_i].date()))
+    return spans

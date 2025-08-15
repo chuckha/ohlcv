@@ -1,7 +1,6 @@
-# ohlcv/calendar.py
 from __future__ import annotations
 from datetime import date
-from typing import List, Optional
+from typing import List
 import pandas_market_calendars as mcal
 
 def sessions(start: date, end: date, market: str = "NYSE") -> List[date]:

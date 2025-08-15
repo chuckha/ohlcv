@@ -1,11 +1,11 @@
-from ohlcv import get_ohlcv_df, configure
+from ohlcv import configure, get_ohlcv_df
 import logging
-logging.basicConfig(level=logging.INFO)  # or DEBUG
+logging.basicConfig(level=logging.INFO)                # set root handler >= INFO
+logging.getLogger("ohlcv").setLevel(logging.INFO)     # or target the package
 
-if __name__ == "__main__":
-    # Configure once (or set env LIGHTQL_DATABASE_URL / OHLCV_SQL_DIR / OHLCV_MARKET)
-    configure(dsn="sqlite:///./data/database.sqlite3", sql_dir="sql", market="XNYS")
+# pick a DB path per-project (isolated data)
+configure(dsn="sqlite:///./data/database.sqlite3", market="NYSE", availability="clip")
 
-    df = get_ohlcv_df(["CRWV", "MSFT"], "2025-01-12", "2025-04-20")
-    import pdb; pdb.set_trace()
-    print(df.tail())
+mi = get_ohlcv_df(["AAPL","MSFT","CRWV"], "2025-01-02", "2025-04-20")
+print(mi.columns)        # MultiIndex: (field, ticker)
+print(mi.tail())

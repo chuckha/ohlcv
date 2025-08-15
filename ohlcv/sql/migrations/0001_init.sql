@@ -13,5 +13,4 @@ CREATE TABLE IF NOT EXISTS bars (
   PRIMARY KEY (ticker, date)
 );
 
--- for common window scans
 CREATE INDEX IF NOT EXISTS idx_bars_ticker_date ON bars(ticker, date);
