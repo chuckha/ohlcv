@@ -2,6 +2,8 @@ from __future__ import annotations
 from typing import Iterable, Sequence, Dict, List, Tuple
 from datetime import date, datetime
 import pandas as pd
+import logging
+log = logging.getLogger(__name__)
 
 from .protocols import Store, Provider
 from .calendar import sessions
@@ -19,6 +21,7 @@ def get_ohlcv_df(
     store: Store,
     provider: Provider,
     include_partial: bool = False,
+    market: str = "NYSE",
 ) -> pd.DataFrame:
     """Local-first OHLCV fetch with gap fill, returning a contiguous daily DataFrame.
 
@@ -38,7 +41,7 @@ def get_ohlcv_df(
     """
     tks = _normalize_tickers(tickers)
     s, e = _normalize_dates(start, end)
-    expected = sessions(s, e)
+    expected = sessions(s, e, market)
 
     # 1) Read what's present
     df0 = store.read_df(tks, s, e)
@@ -46,12 +49,14 @@ def get_ohlcv_df(
 
     # 2) Compute gaps per ticker
     gaps = _find_gaps(df0, tks, expected)
+    log.debug("gap spans: %s", gaps)
 
     # 3) Fetch + upsert missing spans
     for tkr, spans in gaps.items():
         for span_s, span_e in spans:
             fetched = provider.fetch_df([tkr], span_s, span_e)
             fetched = _normalize_df(fetched)
+            log.debug("fetched %s rows for %s %s..%s", len(fetched), tkr, span_s, span_e)
             if not fetched.empty:
                 store.upsert_df(fetched)
 
@@ -61,6 +66,7 @@ def get_ohlcv_df(
 
     # 5) Validate / trim to expected sessions
     missing_after = _find_gaps(final, tks, expected)
+    log.debug("missing_after: %s", missing_after)
     if missing_after and not include_partial:
         raise DataNotContiguous(missing_after)
 

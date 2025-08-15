@@ -42,18 +42,28 @@ class SqlStore(Store):
     def upsert_df(self, df: pd.DataFrame) -> None:
         if df is None or df.empty:
             return
-        # ensure columns and coerce types minimally
-        df = df.reindex(columns=REQUIRED_COLS)
-        df = df.copy()
+
+        df = df.reindex(columns=REQUIRED_COLS).copy()
         df["ticker"] = df["ticker"].astype(str).str.upper()
         df["date"] = pd.to_datetime(df["date"]).dt.date.apply(_to_datestr)
-        for c in ["open", "high", "low", "close"]:
+        for c in ["open","high","low","close"]:
             df[c] = df[c].astype(float)
         df["volume"] = df["volume"].astype("int64", errors="ignore")
-        for rec in df.to_dict("records"):
-            # :affected query returns rowcount; we ignore here
-            self.q.bars.upsert(**rec)
 
+        records = df.to_dict("records")
+        CHUNK = 1000
+        for i in range(0, len(records), CHUNK):
+            chunk = records[i:i+CHUNK]
+            self.conn.conn.execute("BEGIN")  # start txn on the underlying sqlite3.Connection
+            try:
+                for rec in chunk:
+                    self.q.bars.upsert(**rec)
+                self.conn.commit()
+            except Exception:
+                # best‑effort rollback
+                try: self.conn.conn.execute("ROLLBACK")
+                except Exception: pass
+                raise
 
 def _to_datestr(d: date) -> str:
     return d.isoformat()

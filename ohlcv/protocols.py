@@ -22,4 +22,3 @@ class Store(Protocol):
 class Provider(Protocol):
     """External data source. Returns the same schema as Store.read_df."""
     def fetch_df(self, tickers: Sequence[str], start: date, end: date) -> pd.DataFrame: ...
-
