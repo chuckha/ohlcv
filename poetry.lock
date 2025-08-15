@@ -338,7 +338,7 @@ name = "lightql"
 version = "0.1.0"
 description = "pugsql inspired migrations and queries"
 optional = false
-python-versions = ">=3.12"
+python-versions = ">=3.12,<4.0"
 groups = ["main"]
 files = []
 develop = true
@@ -932,5 +932,5 @@ repair = ["scipy (>=1.6.3)"]
 
 [metadata]
 lock-version = "2.1"
-python-versions = ">=3.12"
-content-hash = "c20e9dd0a389f2298dfba23ed14b1f98c2e6878d85f46ceb49b24edccda76fd0"
+python-versions = ">=3.12,<4.0"
+content-hash = "c18cfee098c8b3bc468b91ab84ae0275a5790c6fa20080f2a3ced9e776787cdd"
