@@ -335,7 +335,7 @@ files = [
 
 [[package]]
 name = "lightql"
-version = "0.2.1"
+version = "0.2.2"
 description = "pugsql inspired migrations and queries"
 optional = false
 python-versions = ">=3.12,<4.0"
@@ -344,8 +344,10 @@ files = []
 develop = true
 
 [package.source]
-type = "directory"
-url = "../lightql"
+type = "git"
+url = "https://github.com/chuckha/lightql.git"
+reference = "HEAD"
+resolved_reference = "f88e7a7d44288b82be293caebc9619111d31bb0c"
 
 [[package]]
 name = "multitasking"
@@ -933,4 +935,4 @@ repair = ["scipy (>=1.6.3)"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.12,<4.0"
-content-hash = "c18cfee098c8b3bc468b91ab84ae0275a5790c6fa20080f2a3ced9e776787cdd"
+content-hash = "4245f8e3da79f7221a2396fa64b5f81579349d93616e00ace0df12adeb0030e0"
