@@ -16,7 +16,6 @@ from .schema import ensure_schema
 class OhlcvClient:
     store: SqlStore
     provider: YFProvider
-    market: str = "NYSE"
     availability: str = "clip"
 
     def get_df(self, tickers: Sequence[str], start: date | str, end: date | str):
@@ -24,7 +23,6 @@ class OhlcvClient:
             tickers, start, end,
             store=self.store,
             provider=self.provider,
-            market=self.market,
             availability=self.availability,
         )
 
@@ -32,7 +30,7 @@ class OhlcvClient:
 _default_client: OhlcvClient | None = None
 
 
-def configure(*, dsn: str | None = None, market: str | None = None, availability: str | None = None) -> None:
+def configure(*, dsn: str | None = None, availability: str | None = None) -> None:
     """Configure the default client.
 
     - Loads packaged SQL/migrations.
@@ -41,7 +39,6 @@ def configure(*, dsn: str | None = None, market: str | None = None, availability
     """
     global _default_client
     dsn = dsn or os.getenv("LIGHTQL_DATABASE_URL") or "sqlite:///./data/database.sqlite3"
-    market = (market or os.getenv("OHLCV_MARKET", "NYSE")).upper()
     availability = (availability or os.getenv("OHLCV_AVAILABILITY", "clip")).lower()
     if availability not in {"clip", "strict"}: availability = "clip"
 
@@ -50,7 +47,7 @@ def configure(*, dsn: str | None = None, market: str | None = None, availability
 
     store = SqlStore(dsn=dsn)
     provider = YFProvider(auto_adjust=False)
-    _default_client = OhlcvClient(store=store, provider=provider, market=market, availability=availability)
+    _default_client = OhlcvClient(store=store, provider=provider, availability=availability)
 
 
 def _ensure_default_client() -> OhlcvClient:

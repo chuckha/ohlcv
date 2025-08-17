@@ -63,19 +63,19 @@ class SqlStore(Store):
 
     def get_meta(self, tickers: Sequence[str]) -> Dict[str, Dict[str, Optional[str]]]:
         out: Dict[str, Dict[str, Optional[str]]] = {}
-        print([k for k in self.q._queries.keys() if k.startswith("symbol_meta")])
         for t in [str(x).upper() for x in tickers]:
             try:
                 row = self.q.execute("symbol_meta.get_one", ticker=t)
             except Exception:
                 row = None
             if not row:
-                out[t] = {"first_seen_date": None, "last_seen_date": None, "skip_before": None}
+                out[t] = {"first_seen_date": None, "last_seen_date": None, "skip_before": None, "stop_after": None}
             else:
                 out[t] = {
                     "first_seen_date": row.get("first_seen_date"),
                     "last_seen_date": row.get("last_seen_date"),
                     "skip_before": row.get("skip_before"),
+                    "stop_after": row.get("stop_after"),
                 }
         return out
 
@@ -95,6 +95,7 @@ class SqlStore(Store):
                 last_seen_date=dmax,
                 updated_at=now,
             )
+        self.conn.commit()
 
     def advance_skip_before(self, ticker: str, when_date: date) -> None:
         now = datetime.utcnow().isoformat(timespec="seconds") + "Z"
@@ -102,6 +103,15 @@ class SqlStore(Store):
             "symbol_meta.advance_skip_before",
             ticker=str(ticker).upper(),
             skip_before=when_date.isoformat(),
+            updated_at=now,
+        )
+
+    def advance_stop_after(self, ticker: str, when_date: date) -> None:
+        now = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        self.q.execute(
+            "symbol_meta.advance_stop_after",
+            ticker=str(ticker).upper(),
+            stop_after=when_date.isoformat(),
             updated_at=now,
         )
 

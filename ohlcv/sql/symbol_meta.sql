@@ -31,3 +31,14 @@ ON CONFLICT(ticker) DO UPDATE SET
     ELSE symbol_meta.skip_before
   END,
   updated_at = excluded.updated_at;
+
+-- :name symbol_meta.advance_stop_after :affected
+INSERT INTO symbol_meta (ticker, stop_after, updated_at)
+VALUES (:ticker, :stop_after, :updated_at)
+ON CONFLICT(ticker) DO UPDATE SET
+  stop_after = CASE
+    WHEN symbol_meta.stop_after IS NULL THEN excluded.stop_after
+    WHEN excluded.stop_after > symbol_meta.stop_after THEN excluded.stop_after
+    ELSE symbol_meta.stop_after
+  END,
+  updated_at = excluded.updated_at;
